@@ -34,6 +34,34 @@ To run the evaluation code (also computes nDCG, which is not computed at trainin
 python eval_main_HierArtEx_v2_.py --room_vis_agg rnn --room_txt_agg rnn --generalist mobile_clip
 ```
 
+## Data
+
+Domain-specific features (folders starting with "preextracted_vectors_wikiart_") and CLIP features (folder "tmp_museums/open_clip_features_museums3k") can be copied from https://github.com/aranciokov/HierArtEx-MMM2025
+
+Moreover, the following symbolic link should be created:
+```
+a=$PWD
+ln -s $a/tmp_museums/museums3k_new_features/mobile_clip/descriptions/tokens_strings /tmp_museums/museums3k_new_features/blip_base/descriptions/tokens_strings
+```
+
+In the end, this folder will have this structure:
+```
+- preextracted_vectors_wikiart_rn101
+- preextracted_vectors_wikiart_rn50
+- ...
+- preextracted_vectors_wikiart_vitb32
+- tmp_museums
+    - open_clip_features_museums3k
+        - descriptions
+        - images
+    - museums3k_new_features
+        - blip_base
+            - descriptions
+            - images
+        - mobile_clip
+            - descriptions
+            - images
+```
 
 ## Details
 
