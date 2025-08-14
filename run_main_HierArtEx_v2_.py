@@ -73,14 +73,15 @@ visual_bb_ftsize_k = {'rn18': 512, 'rn34': 512, 'rn50': 2048, 'rn101': 2048, 'vi
 
 GENERALIST_FEAT_SIZE_DICT = {
     'clip': 512,
-    'siglip': 768,
-    # 'blip': 512,
     'blip_base': 768,
     'mobile_clip': 512
 }
 
 for vn in visual_bb_ftsize_k.keys():
-    print(vn, torch.load(f"preextracted_vectors_wikiart_{vn}/Museum1554-7.unity.pt", weights_only=True).shape)
+    if os.path.exists(f"preextracted_vectors_wikiart_{vn}/Museum1554-7.unity.pt"):
+        print(vn, torch.load(f"preextracted_vectors_wikiart_{vn}/Museum1554-7.unity.pt", weights_only=True).shape)
+    else:
+        print(vn, "not found")
 
 print("="*20)
 
