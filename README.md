@@ -37,7 +37,7 @@ python eval_main_HierArtEx_v2_.py --room_vis_agg rnn --room_txt_agg rnn --genera
 
 ## Details
 
-Machine setup: python 3.10.12, single A5000 GPU, Intel Xeon W-2123 CPU (3.60GHz)
+Machine setup: python 3.10.12 (CUDA 11.7), single A5000 GPU, Intel Xeon W-2123 CPU (3.60GHz)
 
 Main libraries used: torch 1.13.1, numpy 1.23.5, pandas 1.5.3
 
