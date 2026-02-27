@@ -29,12 +29,13 @@ indices['train'][:10], indices['val'][:10], indices['test'][:10],
 from torch.utils.data import Dataset
 
 class DescriptionSceneMuseum(Dataset):
-    def __init__(self, data_description_path, data_raw_description_path, data_scene_path, data_art_path, indices, split, customized_margin=False):
+    def __init__(self, data_description_path, data_raw_description_path, data_scene_path, data_art_path, indices, split, load_art_vectors=False):
         self.description_path = data_description_path
         self.raw_description_path = data_raw_description_path
         self.data_pov_path = data_scene_path
         self.indices = indices[split]
         self.split = split
+        self.load_art_vectors = load_art_vectors
 
         available_data = [im.strip(".pt") for im in os.listdir(data_scene_path)]
         available_data = sorted(available_data)
@@ -47,7 +48,11 @@ class DescriptionSceneMuseum(Dataset):
                 if re.match(r"^ In the \w+ room , there are", sent)
         ] for sm in self.raw_descs]
         self.pov_images = [torch.load(os.path.join(data_scene_path, f"{sm}.pt"), weights_only=True) for sm in available_data]
-        self.art_vectors = [torch.load(os.path.join(data_art_path, f"{sm}.pt"), weights_only=True) for sm in available_data]
+        if self.load_art_vectors:
+            self.art_vectors = [torch.load(os.path.join(data_art_path, f"{sm}.pt"), weights_only=True) for sm in available_data]
+        else:
+            self.art_vectors = []
+
         self.names = available_data
         print(f"'{split.upper()}': {len(self.names)} names, "
               f"{len(self.descs)} sentences ({sum([len(x) for x in self.descs]) / len(self.descs)} avg), "
@@ -61,7 +66,10 @@ class DescriptionSceneMuseum(Dataset):
         # if self.split == "train":
         raw_desc = self.raw_descs[index]
         scene_img_tensor = self.pov_images[index]
-        scene_art_tensor = self.art_vectors[index]
+        if self.load_art_vectors:
+            scene_art_tensor = self.art_vectors[index]
+        else:
+            scene_art_tensor = torch.zeros_like(scene_img_tensor)
         name = self.names[index]
         room_desc_indices = self.room_desc_indices[index]
 
@@ -323,12 +331,22 @@ def save_best_model(model_name, run_folder, *args):
 def load_best_model(model_name, run_folder):
     model_path = os.path.join("models", run_folder)
     avail_models = [m for m in os.listdir(model_path) if m.startswith(model_name)]
-    assert len(avail_models) == 1, avail_models
-    model_name_ = avail_models[0]
+    if len(avail_models) == 1:
+        model_name_ = avail_models[0]
+    elif f"{model_name}.pt" in avail_models:
+        model_name_ = f"{model_name}.pt"
+    else:
+        raise ValueError(f"Multiple models found starting with the name {model_name} in {model_path}: {avail_models}")
     model_path = model_path + os.sep + model_name_
     check_point = torch.load(model_path, weights_only=True)
     bm_list = [check_point[bm] for bm in check_point.keys()]
     return bm_list
+
+def load_this_model(model_path):
+    check_point = torch.load(model_path, weights_only=True)
+    bm_list = [check_point[bm] for bm in check_point.keys()]
+    return bm_list
+
 import torch.nn as nn
 
 class HierGRUNet(nn.Module):
@@ -357,23 +375,23 @@ class HierGRUNet(nn.Module):
                                     torch.cumsum(torch.tensor(outer_lens + [len(outer_lens)]), dim=0).tolist())]  # -> (B, N, F)
         out_h_n_room = torch.cat([h_n_room[ol_s+1:ol_e] for ol_s, ol_e in aa], 0)  # -> (B, N, F)
         # ^ to align the room-level text vectors to the image ones, we ought to ignore the first sentence (In the museum there are...)
-        x1 = [h_n_room[ol_s:ol_e] for ol_s, ol_e in aa]  # -> (B, N, F)
+        x1_ragged = [h_n_room[ol_s:ol_e] for ol_s, ol_e in aa]  # -> (B, N, F)
         if self.room_txt_agg in ['rnn', 'monornn']:
-            x1 = pad_sequence(x1, batch_first=True)
+            x1 = pad_sequence(x1_ragged, batch_first=True)
             x1 = pack_padded_sequence(x1,
                                       torch.tensor(outer_lens),
                                       batch_first=True,
                                       enforce_sorted=False)
             _, h_n_museum = self.gru_museum(x1)
             if self.is_bidirectional:
-                return out_h_n_room, h_n_museum.mean(0)
+                return out_h_n_room, h_n_museum.mean(0), x1_ragged[:-1]
             else:
-                return out_h_n_room, h_n_museum.squeeze(0)
+                return out_h_n_room, h_n_museum.squeeze(0), x1_ragged[:-1]
         else:
             # print([a.shape for a in x1])
-            x1 = pad_sequence(x1, batch_first=True)[:-1]
+            x1 = pad_sequence(x1_ragged, batch_first=True)[:-1]
             h_n_museum = x1.sum(-2) / torch.tensor(outer_lens, device=x1.device).unsqueeze(1)
-        return out_h_n_room.squeeze(0), h_n_museum.squeeze(0)
+        return out_h_n_room.squeeze(0), h_n_museum.squeeze(0), x1_ragged[:-1]
     
 
 
@@ -526,8 +544,8 @@ class MyBaseline(nn.Module):
                 x1[item_idx, list_length[item_idx]:, :] = 0
         x1 = self.relu(x1)
         
-        x1 = x1.sum(1) / (x1.sum(-1) > 0).sum(1).unsqueeze(-1)
-        x1 = x1.view(x1.size(0), -1)
+        list_length_t = torch.tensor(list_length, device=x1.device) if isinstance(list_length, list) else list_length.to(x1.device)
+        x1 = x1.sum(1) / list_length_t.unsqueeze(1)
         x1 = self.fc(x1)
         return x1
 
@@ -661,22 +679,53 @@ def main_proc(_loader, _model_desc_pov, _model_pov, _phase, _indices, _eval, _sc
             bsz, fts, no_room_times_no_imgs = data_pov.shape
 
             if isinstance(_model_desc_pov, HierGRUNet):
-                output_room_lev_desc, output_desc_pov = _model_desc_pov(data_desc_pov, inner_lengths, outer_lengths)
+                output_room_lev_desc, output_desc_pov, output_room_lev_desc_ragged = _model_desc_pov(data_desc_pov, inner_lengths, outer_lengths)
                 
             else:
                 output_room_lev_desc = None
                 output_desc_pov = _model_desc_pov(data_desc_pov)
                 
+            if not args.no_artexp:
+                x_input = torch.cat((
+                    data_pov.transpose(1, 2), 
+                    data_art.transpose(1, 2)
+                ), -1)
+            else:
+                x_input = data_pov.transpose(1, 2)
 
             if isinstance(_model_pov, MyHierBaseline_v3):
-                output_pov_img_level, output_pov_room_level, output_pov = _model_pov(data_pov, data_art, len_pov, imgs_per_room=12)
-                room_len_pov = len_pov // 12
-                tmp_output_pov_room_level = torch.cat([output_pov_room_level[i, :ix] for i, ix in enumerate(room_len_pov)], 0)
+                if args.other_method is None:
+                    output_pov_img_level, output_pov_room_level, output_pov = _model_pov(data_pov, data_art, len_pov, imgs_per_room=12)
+                    room_len_pov = len_pov // 12
+                    tmp_output_pov_room_level = torch.cat([output_pov_room_level[i, :ix] for i, ix in enumerate(room_len_pov)], 0)
+                else:
+                    tmp_output_pov_room_level = None
+                    output_pov = _model_pov(data_pov, data_art, len_pov, imgs_per_room=12)
                 # print(tmp_output_pov_room_level.shape)  # (B*, F)
+            
+            elif isinstance(_model_pov, MVCNN):
+                tmp_output_pov_room_level = None
+                _, _, output_pov = _model_pov(data_pov, data_art, list_length=len_pov, clip_mask=None, imgs_per_room=12)
+            
+            elif isinstance(_model_pov, MVCNN_MVP):
+                tmp_output_pov_room_level = None
+                output_pov, _ = _model_pov(batch_size=data_pov.shape[0], max_num_views=data_pov.shape[2], num_views=len_pov, x=x_input.float())
+            
+            elif isinstance(_model_pov, MVCNNSA):
+                tmp_output_pov_room_level = None
+                _, _, output_pov = _model_pov(data_pov, data_art, list_length=len_pov, clip_mask=None, imgs_per_room=12)
+
+            elif isinstance(_model_pov, DAN):
+                tmp_output_pov_room_level = None
+                output_pov, _ = _model_pov(batch_size=data_pov.shape[0], max_num_views=data_pov.shape[2], num_views=len_pov, x=x_input.float())
                 
+            elif isinstance(_model_pov, VSFormer):
+                tmp_output_pov_room_level = None
+                output_pov, _ = _model_pov(batch_size=data_pov.shape[0], max_num_views=data_pov.shape[2], num_views=len_pov, x=x_input.float())
+
             else:
                 tmp_output_pov_room_level = None
-                output_pov = _model_pov(data_pov, x_art=data_art if not args.no_artexp else None)
+                output_pov = _model_pov(data_pov, data_art if not args.no_artexp else None, len_pov)
 
             multiplication_dp = cosine_sim(output_desc_pov, output_pov)
             if output_room_lev_desc is not None and tmp_output_pov_room_level is not None:
@@ -706,7 +755,7 @@ def evaluate_ndcg(_model_pov, _model_desc_pov, _r1s, _r5s, _r10s, _medrs, _ndcgs
     output_pov_test_gpu = output_pov_test.to(device)
     output_description_test_gpu = output_description_test.to(device)
     if not skip_ndcg:
-        which_concepts_nums = [5, 10, 15] if not ndcg_10concepts_only else [10]
+        which_concepts_nums = [3, 5, 10, 15] if not ndcg_10concepts_only else [10]
         for it, n_most_common in enumerate(which_concepts_nums):
             gt_concepts = []
             for ix in range(450):
@@ -721,7 +770,7 @@ def evaluate_ndcg(_model_pov, _model_desc_pov, _r1s, _r5s, _r10s, _medrs, _ndcgs
             next_thr = 0.5
             
             
-            for n_top_k in [5, 10, 15, 25, 50]: #, 450]:
+            for n_top_k in [5, 10, 15]: #, 450]:
                 concepts_as_in_ranking_list = []
                 for ix in tqdm(range(450), total=450):
                     query_fts = output_description_test_gpu[ix:ix+1]
@@ -750,6 +799,37 @@ def evaluate_ndcg(_model_pov, _model_desc_pov, _r1s, _r5s, _r10s, _medrs, _ndcgs
                     _ndcgs[f"{n_most_common}"][f"ALL{next_thr}"].append(ndcg_values.mean()*100)
                 else:
                     _ndcgs[f"{n_most_common}"][f"{n_top_k}"].append(ndcg_values.mean()*100)
+
+
+            ##### MUSEUM 2 TEXT
+            for n_top_k in [5, 10, 15]: #, 450]:
+                concepts_as_in_ranking_list = []
+                for ix in range(450):  #tqdm(range(450), total=450):
+                    mus_fts = output_pov_test_gpu[ix:ix+1]
+            
+                    ext_res = torch.topk(cosine_sim(output_description_test_gpu.float(), mus_fts), k=min(n_top_k, rel_nums[ix].item()), dim=0)
+
+                    this_query_concepts  = []
+                    for other_ix in ext_res[1]:
+                        rd = _test_dataset[other_ix.item()][-3]
+                        words = word_tokenize(rd.lower())
+                        most_common_words = filter_proc(words, n_most_common)
+                        this_query_concepts.append(", ".join(most_common_words))
+                    concepts_as_in_ranking_list.append(this_query_concepts)
+                    
+                ndcg_values = []
+                for gt_c, pred_c in zip(gt_concepts, concepts_as_in_ranking_list):
+                    rel_scores = get_relevance_values(gt_c, pred_c)
+                    gt_rel_scores = get_relevance_values(gt_c, gt_concepts)
+                    # print(f"{ndcg(rel_scores)}")
+                    ndcg_values.append(ndcg(rel_scores, gt_rel_scores))
+                ndcg_values = np.array(ndcg_values)
+                # which_ndcgs[it].append(ndcg_values.mean()*100)
+                if n_top_k == 450:
+                    _ndcgs[f"{n_most_common}"][f"m2t_ALL{next_thr}"].append(ndcg_values.mean()*100)
+                else:
+                    _ndcgs[f"{n_most_common}"][f"m2t_{n_top_k}"].append(ndcg_values.mean()*100)
+
 
     r1 = np.array(r1)
     r5 = np.array(r5)
@@ -802,6 +882,13 @@ if __name__ == "__main__":
         help='Visual aggregation strategy for room content (rnn or avg)'
     )
 
+    parser.add_argument(
+        '--lambda-rooms',
+        type=float,
+        default=1.0,
+        help='Weight for the room-level loss'
+    )
+
     ######## for ablations
     parser.add_argument(
         '--no-hiervis',
@@ -824,6 +911,70 @@ if __name__ == "__main__":
         help='Visual aggregation strategy for room content (rnn or avg)'
     )
 
+    parser.add_argument(
+        '--skip-ndcg',
+        action="store_true",
+        default=False,
+        help='Visual aggregation strategy for room content (rnn or avg)'
+    )
+
+    parser.add_argument(
+        '--room-loss-weight',
+        type=float,
+        default=1.,
+        help='Weight for the room-level loss component'
+    )
+
+    parser.add_argument(
+        '--other-method',
+        type=str,
+        choices=['DAN', 'VSFormer', 'MVCNN', 'MVCNNSA', 'merge-rooms-museum-repr'],
+        default=None,
+        help='If specified, use an alternative method instead of HierArtEx.'
+    )
+
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=64,
+        help='If specified, use an alternative method instead of HierArtEx.'
+    )
+
+    parser.add_argument(
+        '--epochs',
+        type=int,
+        default=50,
+        help=''
+    )
+
+    parser.add_argument(
+        '--n-tries',
+        type=int,
+        default=3,
+        help=''
+    )
+
+    parser.add_argument(
+        '--lr',
+        type=float,
+        default=0.001,
+        help=''
+    )
+
+    parser.add_argument(
+        '--resume-ckpts',
+        nargs="+",
+        default=[],
+        help=''
+    )
+
+    parser.add_argument(
+        '--eval-user-queries',
+        action="store_true",
+        default=False,
+        help=''
+    )
+    
     args = parser.parse_args()
     
     
@@ -836,11 +987,16 @@ if __name__ == "__main__":
     import numpy as np
     import time
 
+    from dan import DAN
+    from other_methods import MVCNN, MVCNNSA
+    from vsformer import VSFormer
+    from mvcnn import MVCNN as MVCNN_MVP
+
     import random
     import string
     run_folder = ''.join(random.choices(string.ascii_uppercase + string.digits, k=5))
 
-    batch_size = 64
+    batch_size = args.batch_size
 
     visual_backbone = args.artexp
     visual_bb_ftsize = visual_bb_ftsize_k[visual_backbone]
@@ -855,42 +1011,111 @@ if __name__ == "__main__":
                                            f"./{base_path}/descriptions/tokens_strings", 
                                            f"./{base_path}/images",
                                            f"./preextracted_vectors_wikiart_{visual_backbone}",
-                                    indices, "test")
+                                    indices, "test", load_art_vectors=not args.no_artexp)
     
     collate_fn_to_use = collate_fn if not args.no_hiertxt else collate_fn_desc
     test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn_to_use, shuffle=False, num_workers=4, worker_init_fn=seed_worker, generator=g)
 
-    num_epochs = 50
-    number_of_tries = 3
+    num_epochs = args.epochs
+    number_of_tries = args.n_tries
     final_output_strings = []
 
     output_feature_size = 256 # default: 256
     is_bidirectional = 'mono' not in args.room_txt_agg
     is_bidirectional_RNN_scenes = 'mono' not in args.room_vis_agg
-    room_loss_weight = 1.
+    room_loss_weight = args.lambda_rooms
     room_txt_agg = args.room_txt_agg  # rnn, avg
     room_vis_agg = args.room_vis_agg  # rnn, avg
 
-    if args.no_hiervis or args.no_hiertxt or args.no_artexp:
-        approach_name = "hierarchical_v2"
+
+    if args.other_method is None:
+        if args.no_hiervis or args.no_hiertxt or args.no_artexp:
+            approach_name = "hierarchical_v2"
+            if not args.no_artexp:
+                approach_name += f"_art_vectors_{visual_backbone}"
+            if not args.no_hiertxt:
+                approach_name += f"_hier_loss_room{room_loss_weight}_txt{room_txt_agg}"
+            if not args.no_hiervis:
+                approach_name += f"_vis{'bi' if is_bidirectional_RNN_scenes else ''}{room_vis_agg}"
+            approach_name += f"_gen_{GENERALIST}"
+            
+        else:
+            approach_name = f"hierarchical_v3_art_vectors_{visual_backbone}_hier_loss_room{room_loss_weight}_vis{'bi' if is_bidirectional_RNN_scenes else ''}{room_vis_agg}_txt{room_txt_agg}_gen_{GENERALIST}"
+    
+    else:
+        approach_name = args.other_method + f"_gen_{GENERALIST}"
         if not args.no_artexp:
             approach_name += f"_art_vectors_{visual_backbone}"
-        if not args.no_hiertxt:
-            approach_name += f"_hier_loss_room{room_loss_weight}_txt{room_txt_agg}"
-        if not args.no_hiervis:
-            approach_name += f"_vis{'bi' if is_bidirectional_RNN_scenes else ''}{room_vis_agg}"
-        approach_name += f"_gen_{GENERALIST}"
+    print("=== SHOULD BE:", approach_name)
         
-    else:
-        approach_name = f"hierarchical_v3_art_vectors_{visual_backbone}_hier_loss_room{room_loss_weight}_vis{'bi' if is_bidirectional_RNN_scenes else ''}{room_vis_agg}_txt{room_txt_agg}_gen_{GENERALIST}"
+
+    if args.eval_user_queries:
+
+        def create_rank_query(result, entire_descriptor, desired_output_index):
+            similarity_desc_query = torch.nn.functional.cosine_similarity(entire_descriptor, result, dim=1)
+            similarity_desc_query = similarity_desc_query.squeeze()
+
+            sorted_indices = torch.argsort(similarity_desc_query, descending=True)
+            if desired_output_index.dim() == 0:
+                positions = (sorted_indices.unsqueeze(0) == desired_output_index.unsqueeze(0))
+            else:
+                positions = (sorted_indices.unsqueeze(0) == desired_output_index.unsqueeze(1))
+            match_positions = torch.nonzero(positions, as_tuple=False)
+            lowest_rank = match_positions[:, 1].min()
+
+            return lowest_rank.item(), sorted_indices
+
+
+        def evaluate_query_train(output_query, output, section, relevance_matrix=None, subset_queries=-1, no_queries_per_image=1):
+            avg_rank_query = 0
+            ranks_query = []
+            if subset_queries > 0:
+                output_query = output_query[:subset_queries]
+
+            for j, i in enumerate(output_query):
+                rank, sorted_list = create_rank_query(i, output, torch.nonzero(relevance_matrix[j // no_queries_per_image, :]).squeeze())
+
+                avg_rank_query += rank
+                ranks_query.append(rank)
+
+            ranks_query = np.array(ranks_query)
+
+            n_q = len(output_query)
+            r1 = 100 * len(np.where(ranks_query < 1)[0]) / n_q
+            r5 = 100 * len(np.where(ranks_query < 5)[0]) / n_q
+            r10 = 100 * len(np.where(ranks_query < 10)[0]) / n_q
+            medr = np.median(ranks_query) + 1
+            meanr = ranks_query.mean() + 1
+
+            qd_out = ""
+            for mn, mv in [("R@1", r1),
+                        ("R@5", r5),
+                        ("R@10", r10),
+                        ("median rank", medr),
+                        ("mean rank", meanr),
+                        ]:
+                qd_out += f"{mn}: {mv:.4f}   "
+
+            """print(section + " data: ")
+            print("Queries ranking: " + qd_out)
+
+            print("-" * 5)
+            print("{qd_r1};{qd_r5};{qd_r10};{qd}")"""
+            print(f"{r1};{r5};{r10};{medr}")
+            """print("-" * 5)"""
+            formatted_string = f"{r1};{r5};{r10};{medr}"
+            return r1, r5, r10, medr, formatted_string
 
         
     r1s, r5s, r10s, medrs = [], [], [], []
-    ndcgs = {nc: {k: [] for k in ['5', '10', '15', '25', '50', 'ALL0.5', 'ALL0.25']} for nc in ['5', '10', '15']}
+    ndcgs = {nc: {k: [] for k in [
+        '5', '10', '15', '25', '50', 'ALL0.5', 'ALL0.25',
+        'm2t_5', 'm2t_10', 'm2t_15', 'm2t_25', 'm2t_50', 'm2t_ALL0.5', 'm2t_ALL0.25',
+        ]} for nc in ['3', '5', '10', '15']}
     
     gt_rel_mat = {}
     gt_rel_num = {}
-    for n_most_common in [5, 10, 15]:
+    for n_most_common in [3, 5, 10, 15]:
         gt_concepts = []
         for ix in tqdm(range(450), total=450):
             raw_desc = test_dataset[ix][-3]
@@ -911,22 +1136,81 @@ if __name__ == "__main__":
         else:
             model_desc_pov = HierGRUNet(hidden_size=output_feature_size, num_features=GENERALIST_FEAT_SIZE, is_bidirectional=is_bidirectional, room_txt_agg=room_txt_agg)
         
-        if args.no_hiervis:
-            model_pov = MyBaseline(in_channels=GENERALIST_FEAT_SIZE, out_channels=256, feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
-        else:
-            model_pov = MyHierBaseline_v3(in_channels=GENERALIST_FEAT_SIZE, out_channels=256, feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0, bidirectional=is_bidirectional_RNN_scenes, room_vis_agg=room_vis_agg)
+        if args.other_method is None:        
+            if args.no_hiervis:
+                __model_arch = "MyBaseline"
+                model_pov = MyBaseline(in_channels=GENERALIST_FEAT_SIZE, out_channels=256, feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+            else:
+                __model_arch = "MyHierBaseline_v3"
+                model_pov = MyHierBaseline_v3(in_channels=GENERALIST_FEAT_SIZE, out_channels=256, feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0, bidirectional=is_bidirectional_RNN_scenes, room_vis_agg=room_vis_agg)
 
+        else:
+            if args.other_method == "DAN":
+                __model_arch = "DAN"
+                model_pov = DAN(h=2, feature_dim=GENERALIST_FEAT_SIZE, num_heads=4, inner_dim=output_feature_size, dropout=0.1, output_feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+            elif args.other_method == "VSFormer":
+                __model_arch = "VSFormer"
+                model_pov = VSFormer(feature_dim=GENERALIST_FEAT_SIZE, num_layers=4, num_heads=8, attention_dropout=0.1, mlp_dropout=0.1, widening_factor=2, output_feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+            elif args.other_method == "MVCNN":
+                __model_arch = "MVCNN"
+                #model_pov = MVCNN(in_channels=GENERALIST_FEAT_SIZE, out_channels=output_feature_size, feature_size=128, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+                model_pov = MVCNN_MVP(feature_dim=GENERALIST_FEAT_SIZE, output_feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+            elif args.other_method == "MVCNNSA":
+                __model_arch = "MVCNNSA"
+                model_pov = MVCNNSA(in_channels=GENERALIST_FEAT_SIZE, out_channels=output_feature_size, feature_size=128, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+            elif args.other_method == "merge-rooms-museum-repr":
+                __model_arch = "merge-rooms-museum-repr"
+                model_pov = MyHierBaseline_v3(in_channels=GENERALIST_FEAT_SIZE, out_channels=256, feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0, bidirectional=is_bidirectional_RNN_scenes, room_vis_agg=room_vis_agg, merge_room_museum_repr=True)
+            else:
+                assert False, args.other_method
         model_desc_pov.to(device)
         model_pov.to(device)
 
 
-        bm_pov, bm_desc_pov = load_best_model(f"{approach_name}_{n_try}", run_folder)
+        if len(args.resume_ckpts) > 0:
+            bm_pov, bm_desc_pov = load_this_model(args.resume_ckpts[n_try])
+            print("Loaded from:", args.resume_ckpts[n_try])
+
+            if 'trf_photo.weight' in bm_pov.keys() and 'trf_mean.weight' in bm_pov.keys():
+                print(bm_pov.keys())
+                # need to update names due to old codebase
+                bm_pov['trf.weight'] = bm_pov['trf_photo.weight']
+                bm_pov['trf.bias'] = bm_pov['trf_photo.bias']
+                bm_pov['fc.weight'] = bm_pov['trf_mean.weight']
+                bm_pov['fc.bias'] = bm_pov['trf_mean.bias']
+                bm_pov.pop("trf_photo.weight", None)
+                bm_pov.pop("trf_photo.bias", None)
+                bm_pov.pop("trf_mean.bias", None)
+                bm_pov.pop("trf_mean.weight", None)
+        else:
+            bm_pov, bm_desc_pov = load_best_model(f"{approach_name}_{n_try}", run_folder)
         model_pov.load_state_dict(bm_pov)
         model_desc_pov.load_state_dict(bm_desc_pov)
 
         model_pov.eval()
         model_desc_pov.eval()
         output_description_test, output_pov_test = main_proc(test_loader, model_desc_pov, model_pov, "test", indices, True, None, None, None, None, None)
+
+        if args.eval_user_queries:
+            print("="*10, f'QUERIES (run {n_try})', "="*10)
+            print("results for 50, 100, ..., 550 queries (n=50 used in paper, avg over the three runs)")
+            data_queries = torch.load(f"./data_query_test{'_mobile_clip' if args.generalist == 'mobile_clip' else ''}.pt", weights_only=True).to(device)
+            relevance = torch.load('./relevance_matrix.pt', weights_only=True).to(device)
+            if isinstance(model_desc_pov, HierGRUNet):
+                _, output_query_test, _ = model_desc_pov(data_queries, None, [1]*data_queries.shape[0])
+                
+            else:
+                output_query_test = model_desc_pov(data_queries)
+
+            for n_queries in range(50, 600, 50):
+                qs1, qs5, qs10, sq1, sq5 = evaluate_query_train(output_query=output_query_test.to(device),
+                                                                            output=output_pov_test.to(device),
+                                                                            relevance_matrix=relevance.to(device),
+                                                                            no_queries_per_image=3,
+                                                                            subset_queries=n_queries,
+                                                                            section='test')
+                
+                #print(f"{n_queries} QUERY TO SCENE: R@1: {qs1}, R@5: {qs5}, R@10: {qs10}")
 
         ds1, ds5, ds10, sd1, sd5, sd10, _, _, ds_medr, sd_medr, formatted_string = evaluate(
             output_description=output_description_test,
@@ -935,7 +1219,7 @@ if __name__ == "__main__":
             out_values=False,
             excel_format=True)
 
-        r1s, r5s, r10s, medrs, ndcgs = evaluate_ndcg(model_pov, model_desc_pov, r1s, r5s, r10s, medrs, ndcgs, test_dataset, output_description_test, output_pov_test, gt_rel_mat=gt_rel_mat)
+        r1s, r5s, r10s, medrs, ndcgs = evaluate_ndcg(model_pov, model_desc_pov, r1s, r5s, r10s, medrs, ndcgs, test_dataset, output_description_test, output_pov_test, gt_rel_mat=gt_rel_mat, skip_ndcg=args.skip_ndcg)
         
 
         final_output_strings.append(formatted_string)
@@ -945,18 +1229,29 @@ if __name__ == "__main__":
         print(out_str)
         cmp_avg.append({k: v for k, v in zip(["tv R1", "tv R5", "tv R10", "vt R1", "vt R5", "vt R10", "tv MedR", "vt MedR"], map(float, out_str.split(";")))})
     
-    ss = ";".join([f"{(cmp_avg[0][k]+cmp_avg[1][k]+cmp_avg[2][k])/3:.1f}" for k in cmp_avg[0].keys()])
+    if len(cmp_avg) == 1:
+        ss = ";".join([f"{cmp_avg[0][k]:.1f}" for k in cmp_avg[0].keys()])
+    else:
+        ss = ";".join([f"{(cmp_avg[0][k]+cmp_avg[1][k]+cmp_avg[2][k])/3:.1f}" for k in cmp_avg[0].keys()])
     print(ss)
 
-    print("\t R@1  R@5  R@10  MedR c5k5 c5k10 c5k15 c5k50 c10k5 c10k10 c10k15 c10k50 c15k5 c15k10 c15k15 c15k50")
-    run_vals = [r1s, r5s, r10s, medrs] 
-    for i in range(3):
-        ss = ', '.join([f"{r[i]:.1f}" for r in run_vals])
-        print(f"run {i}: {ss}")
-    run_vals = [r1s, r5s, r10s, medrs] + [ndcgs[nc][k] for k in ['5', '10', '15', '50'] for nc in ['5', '10', '15']]
+
+    print("========= RE-ORDERED =========")
+    run_vals = [r1s, r5s, r10s, medrs]
+    for nc in ['3', '5', '10', '15']:
+        run_vals.extend([ndcgs[nc][k] for k in ['5', '10', '15', '50']])
     ss = ', '.join([f"{np.array(r).mean():.1f}" for r in run_vals])
     print(f"  AVG: {ss}")
 
+    ### MUSEUM 2 TEXT
+    run_vals = []
+    for nc in ['3', '5', '10', '15']:
+        run_vals.extend([ndcgs[nc][f"m2t_{k}"] for k in ['5', '10', '15', '50']])
+    # run_vals = [ndcgs[nc][f"m2t_{k}"] for k in ['5', '10', '15', '50'] for nc in ['5', '10', '15']]
+    ss = ', '.join([f"{np.array(r).mean():.1f}" for r in run_vals])
+    print(f"  M2T: {ss}")
+    print()
+    print()
 
 
 

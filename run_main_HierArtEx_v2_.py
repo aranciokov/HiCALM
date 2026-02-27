@@ -28,12 +28,13 @@ indices['train'][:10], indices['val'][:10], indices['test'][:10],
 from torch.utils.data import Dataset
 
 class DescriptionSceneMuseum(Dataset):
-    def __init__(self, data_description_path, data_raw_description_path, data_scene_path, data_art_path, indices, split, customized_margin=False):
+    def __init__(self, data_description_path, data_raw_description_path, data_scene_path, data_art_path, indices, split, load_art_vectors=False):
         self.description_path = data_description_path
         self.raw_description_path = data_raw_description_path
         self.data_pov_path = data_scene_path
         self.indices = indices[split]
         self.split = split
+        self.load_art_vectors = load_art_vectors
 
         available_data = [im.strip(".pt") for im in os.listdir(data_scene_path)]
         available_data = sorted(available_data)
@@ -46,7 +47,11 @@ class DescriptionSceneMuseum(Dataset):
                 if re.match(r"^ In the \w+ room , there are", sent)
         ] for sm in self.raw_descs]
         self.pov_images = [torch.load(os.path.join(data_scene_path, f"{sm}.pt"), weights_only=True) for sm in available_data]
-        self.art_vectors = [torch.load(os.path.join(data_art_path, f"{sm}.pt"), weights_only=True) for sm in available_data]
+        if self.load_art_vectors:
+            self.art_vectors = [torch.load(os.path.join(data_art_path, f"{sm}.pt"), weights_only=True) for sm in available_data]
+        else:
+            self.art_vectors = []
+
         self.names = available_data
         print(f"'{split.upper()}': {len(self.names)} names, "
               f"{len(self.descs)} sentences ({sum([len(x) for x in self.descs]) / len(self.descs)} avg), "
@@ -60,7 +65,10 @@ class DescriptionSceneMuseum(Dataset):
         if self.split == "train":
             raw_desc = self.raw_descs[index]
         scene_img_tensor = self.pov_images[index]
-        scene_art_tensor = self.art_vectors[index]
+        if self.load_art_vectors:
+            scene_art_tensor = self.art_vectors[index]
+        else:
+            scene_art_tensor = torch.zeros_like(scene_img_tensor)
         name = self.names[index]
         room_desc_indices = self.room_desc_indices[index]
 
@@ -87,14 +95,13 @@ print("="*20)
 
 for vn in GENERALIST_FEAT_SIZE_DICT.keys():
     print("="*10, vn)
-    if vn == "clip":
-        print(torch.load(f"./tmp_museums/open_clip_features_museums3k/images/Museum1554-7.unity.pt", weights_only=True).shape, torch.load(f"./tmp_museums/open_clip_features_museums3k/images/Museum1554-7.unity.pt", weights_only=True).dtype)
-        print(torch.load(f"./tmp_museums/open_clip_features_museums3k/descriptions/sentences/Museum1554-7.unity.pt", weights_only=True).shape, torch.load(f"./tmp_museums/open_clip_features_museums3k/descriptions/sentences/Museum1554-7.unity.pt", weights_only=True).dtype)
-        print(len(pd.read_pickle(f"./tmp_museums/open_clip_features_museums3k/descriptions/tokens_strings/Museum1554-7.unity.pkl")))
+    _prefix_ = f'./tmp_museums/{"open_clip_features_museums3k" if vn == "clip" else f"museums3k_new_features/{vn}"}'
+    if os.path.exists(f"{_prefix_}/descriptions/tokens_strings/Museum1554-7.unity.pkl"):
+        print(torch.load(f"{_prefix_}/images/Museum1554-7.unity.pt", weights_only=True).shape, torch.load(f"{_prefix_}/images/Museum1554-7.unity.pt", weights_only=True).dtype)
+        print(torch.load(f"{_prefix_}/descriptions/sentences/Museum1554-7.unity.pt", weights_only=True).shape, torch.load(f"{_prefix_}/descriptions/sentences/Museum1554-7.unity.pt", weights_only=True).dtype)
+        print(len(pd.read_pickle(f"{_prefix_}/descriptions/tokens_strings/Museum1554-7.unity.pkl")))
     else:
-        print(torch.load(f"./tmp_museums/museums3k_new_features/{vn}/images/Museum1554-7.unity.pt", weights_only=True).shape, torch.load(f"./tmp_museums/museums3k_new_features/{vn}/images/Museum1554-7.unity.pt", weights_only=True).dtype)
-        print(torch.load(f"./tmp_museums/museums3k_new_features/{vn}/descriptions/sentences/Museum1554-7.unity.pt", weights_only=True).shape, torch.load(f"./tmp_museums/museums3k_new_features/{vn}/descriptions/sentences/Museum1554-7.unity.pt", weights_only=True).dtype)
-        print(len(pd.read_pickle(f"./tmp_museums/museums3k_new_features/{vn}/descriptions/tokens_strings/Museum1554-7.unity.pkl")))
+        print(vn, "not found")
         
 
 
@@ -343,8 +350,12 @@ def save_best_model(model_name, run_folder, *args):
 def load_best_model(model_name, run_folder):
     model_path = os.path.join("models", run_folder)
     avail_models = [m for m in os.listdir(model_path) if m.startswith(model_name)]
-    assert len(avail_models) == 1, avail_models
-    model_name_ = avail_models[0]
+    if len(avail_models) == 1:
+        model_name_ = avail_models[0]
+    elif f"{model_name}.pt" in avail_models:
+        model_name_ = f"{model_name}.pt"
+    else:
+        raise ValueError(f"Multiple models found starting with the name {model_name} in {model_path}: {avail_models}")
     model_path = model_path + os.sep + model_name_
     check_point = torch.load(model_path, weights_only=True)
     bm_list = [check_point[bm] for bm in check_point.keys()]
@@ -377,27 +388,27 @@ class HierGRUNet(nn.Module):
                                     torch.cumsum(torch.tensor(outer_lens + [len(outer_lens)]), dim=0).tolist())]  # -> (B, N, F)
         out_h_n_room = torch.cat([h_n_room[ol_s+1:ol_e] for ol_s, ol_e in aa], 0)  # -> (B, N, F)
         # ^ to align the room-level text vectors to the image ones, we ought to ignore the first sentence (In the museum there are...)
-        x1 = [h_n_room[ol_s:ol_e] for ol_s, ol_e in aa]  # -> (B, N, F)
+        x1_ragged = [h_n_room[ol_s:ol_e] for ol_s, ol_e in aa]  # -> (B, N, F)
         if self.room_txt_agg in ['rnn', 'monornn']:
-            x1 = pad_sequence(x1, batch_first=True)
+            x1 = pad_sequence(x1_ragged, batch_first=True)
             x1 = pack_padded_sequence(x1,
                                       torch.tensor(outer_lens),
                                       batch_first=True,
                                       enforce_sorted=False)
             _, h_n_museum = self.gru_museum(x1)
             if self.is_bidirectional:
-                return out_h_n_room, h_n_museum.mean(0)
+                return out_h_n_room, h_n_museum.mean(0), x1_ragged[:-1]
             else:
-                return out_h_n_room, h_n_museum.squeeze(0)
+                return out_h_n_room, h_n_museum.squeeze(0), x1_ragged[:-1]
         else:
             # print([a.shape for a in x1])
-            x1 = pad_sequence(x1, batch_first=True)[:-1]
+            x1 = pad_sequence(x1_ragged, batch_first=True)[:-1]
             h_n_museum = x1.sum(-2) / torch.tensor(outer_lens, device=x1.device).unsqueeze(1)
-        return out_h_n_room.squeeze(0), h_n_museum.squeeze(0)
+        return out_h_n_room.squeeze(0), h_n_museum.squeeze(0), x1_ragged[:-1]
 
 
 class MyHierBaseline_v3(nn.Module):
-    def __init__(self, in_channels, out_channels, feature_size, art_features_size=2048, bidirectional=False, room_vis_agg="avg"):
+    def __init__(self, in_channels, out_channels, feature_size, art_features_size=2048, bidirectional=False, room_vis_agg="avg", merge_room_museum_repr=False, merge_method="max"):
         super().__init__()
         if art_features_size == 0:
             self.use_art = False
@@ -413,6 +424,8 @@ class MyHierBaseline_v3(nn.Module):
             self.trf_museum = nn.Linear(out_channels, feature_size)
         self.bidirectional = bidirectional
         self.room_vis_agg = room_vis_agg
+        self.merge_room_museum_repr = merge_room_museum_repr  # only used for suggesting the loss what to do later
+        self.merge_method = merge_method  # only used for suggesting the loss what to do later
 
     def forward(self, x, x_art, list_length=None, clip_mask=None, imgs_per_room=None):
         x = x.to(torch.float32)
@@ -471,6 +484,23 @@ class MyHierBaseline_v3(nn.Module):
             x1 = x1.sum(1) / (x1.sum(-1) > 0).sum(1).unsqueeze(-1)
             x1 = x1.view(x1.size(0), -1)
             x1 = self.trf_museum(x1)
+        
+        if self.merge_room_museum_repr:
+            if list_length_t.device != x1_museum.device:
+                list_length_t = list_length_t.to(x1_museum.device)
+            ##### merge-rooms-museum-repr with MAX
+            if self.merge_method == "max":
+                x1_aggr_rooms = x1_room.max(1).values
+            ##### merge-rooms-museum-repr with MEAN
+            elif self.merge_method == "mean":
+                x1_aggr_rooms = x1_room.sum(1) / (list_length_t / imgs_per_room).view(-1, 1)
+            elif self.merge_method == "mean-sum":
+                x1_aggr_rooms = x1_room.sum(1) / (list_length_t / imgs_per_room).view(-1, 1)
+                return x1_aggr_rooms + x1_museum
+            elif self.merge_method == "max-sum":
+                x1_aggr_rooms = x1_room.max(1).values
+                return x1_aggr_rooms + x1_museum
+            return torch.cat((x1_aggr_rooms, x1_museum), -1)
         return x1_img, x1_room, x1_museum
     
 
@@ -573,8 +603,8 @@ def main_proc(_loader, _model_desc_pov, _model_pov, _phase, _indices, _eval, _sc
     total_loss = 0
     num_batches = 0
     
-    output_description_total = torch.empty(len(_indices[_phase]), output_feature_size)
-    output_pov_total = torch.empty(len(_indices[_phase]), output_feature_size)
+    output_description_total = torch.empty(len(_indices[_phase]), output_feature_size*2 if (args.other_method == "merge-rooms-museum-repr" and args.merge_method not in ["mean-sum", "max-sum"]) else output_feature_size)
+    output_pov_total = torch.empty(len(_indices[_phase]), output_feature_size*2 if (args.other_method == "merge-rooms-museum-repr" and args.merge_method not in ["mean-sum", "max-sum"]) else output_feature_size)
     
     with torch.set_grad_enabled(_phase == 'train'):
         for i, batch_data in enumerate(_loader):
@@ -604,19 +634,68 @@ def main_proc(_loader, _model_desc_pov, _model_pov, _phase, _indices, _eval, _sc
             bsz, fts, no_room_times_no_imgs = data_pov.shape
 
             if isinstance(_model_desc_pov, HierGRUNet):
-                output_room_lev_desc, output_desc_pov = _model_desc_pov(data_desc_pov, inner_lengths, outer_lengths)
+                output_room_lev_desc, output_desc_pov, output_room_lev_desc_ragged = _model_desc_pov(data_desc_pov, inner_lengths, outer_lengths)
+                if args.other_method == "merge-rooms-museum-repr":
+                    if args.merge_method == "max":
+                        output_desc_pov = torch.cat((
+                            torch.stack([orld.max(0).values for orld in output_room_lev_desc_ragged]),
+                            #torch.stack([orld.mean(0) for orld in output_room_lev_desc_ragged]),
+                            output_desc_pov),
+                        -1)
+                    elif args.merge_method == "mean":
+                        output_desc_pov = torch.cat((
+                            torch.stack([orld.mean(0) for orld in output_room_lev_desc_ragged]),
+                            #torch.stack([orld.mean(0) for orld in output_room_lev_desc_ragged]),
+                            output_desc_pov),
+                        -1)
+                    elif args.merge_method == "mean-sum":
+                        output_desc_pov = torch.stack([orld.max(0).values for orld in output_room_lev_desc_ragged]) + output_desc_pov
+                    
+                    elif args.merge_method == "max-sum":
+                        output_desc_pov = torch.stack([orld.max(0).values for orld in output_room_lev_desc_ragged]) + output_desc_pov
                 
             else:
                 output_room_lev_desc = None
                 output_desc_pov = _model_desc_pov(data_desc_pov)
-
+            
+            if not args.no_artexp:
+                x_input = torch.cat((
+                    data_pov.transpose(1, 2), 
+                    data_art.transpose(1, 2)
+                ), -1)
+            else:
+                x_input = data_pov.transpose(1, 2)
 
             if isinstance(_model_pov, MyHierBaseline_v3):
-                output_pov_img_level, output_pov_room_level, output_pov = _model_pov(data_pov, data_art, len_pov, imgs_per_room=12)
-                room_len_pov = len_pov // 12
-                tmp_output_pov_room_level = torch.cat([output_pov_room_level[i, :ix] for i, ix in enumerate(room_len_pov)], 0)
+                if args.other_method is None:
+                    output_pov_img_level, output_pov_room_level, output_pov = _model_pov(data_pov, data_art, len_pov, imgs_per_room=12)
+                    room_len_pov = len_pov // 12
+                    tmp_output_pov_room_level = torch.cat([output_pov_room_level[i, :ix] for i, ix in enumerate(room_len_pov)], 0)
+                else:
+                    tmp_output_pov_room_level = None
+                    output_pov = _model_pov(data_pov, data_art, len_pov, imgs_per_room=12)
                 # print(tmp_output_pov_room_level.shape)  # (B*, F)
+            
+            elif isinstance(_model_pov, MVCNN):
+                tmp_output_pov_room_level = None
+                _, _, output_pov = _model_pov(data_pov, data_art, list_length=len_pov, clip_mask=None, imgs_per_room=12)
+            
+            elif isinstance(_model_pov, MVCNN_MVP):
+                tmp_output_pov_room_level = None
+                output_pov, _ = _model_pov(batch_size=data_pov.shape[0], max_num_views=data_pov.shape[2], num_views=len_pov, x=x_input.float())
+            
+            elif isinstance(_model_pov, MVCNNSA):
+                tmp_output_pov_room_level = None
+                _, _, output_pov = _model_pov(data_pov, data_art, list_length=len_pov, clip_mask=None, imgs_per_room=12)
+
+            elif isinstance(_model_pov, DAN):
+                tmp_output_pov_room_level = None
+                output_pov, _ = _model_pov(batch_size=data_pov.shape[0], max_num_views=data_pov.shape[2], num_views=len_pov, x=x_input.float())
                 
+            elif isinstance(_model_pov, VSFormer):
+                tmp_output_pov_room_level = None
+                output_pov, _ = _model_pov(batch_size=data_pov.shape[0], max_num_views=data_pov.shape[2], num_views=len_pov, x=x_input.float())
+
             else:
                 tmp_output_pov_room_level = None
                 output_pov = _model_pov(data_pov, x_art=data_art if not args.no_artexp else None)
@@ -739,6 +818,57 @@ if __name__ == "__main__":
         help='Visual aggregation strategy for room content (rnn or avg)'
     )
 
+    parser.add_argument(
+        '--room-loss-weight',
+        type=float,
+        default=1.,
+        help='Weight for the room-level loss component'
+    )
+
+    parser.add_argument(
+        '--other-method',
+        type=str,
+        choices=['DAN', 'VSFormer', 'MVCNN', 'MVCNNSA', 'merge-rooms-museum-repr'],
+        default=None,
+        help='If specified, use an alternative method instead of HierArtEx.'
+    )
+
+    parser.add_argument(
+        '--merge-method',
+        type=str,
+        choices=['max', 'mean', 'mean-sum', 'max-sum'],
+        default=None,
+        help='If specified, use an alternative method instead of HierArtEx.'
+    )
+
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=64,
+        help='If specified, use an alternative method instead of HierArtEx.'
+    )
+
+    parser.add_argument(
+        '--epochs',
+        type=int,
+        default=50,
+        help=''
+    )
+
+    parser.add_argument(
+        '--n-tries',
+        type=int,
+        default=3,
+        help=''
+    )
+
+    parser.add_argument(
+        '--lr',
+        type=float,
+        default=0.001,
+        help=''
+    )
+
     args = parser.parse_args()
     
     
@@ -751,11 +881,16 @@ if __name__ == "__main__":
     import numpy as np
     import time
 
+    from dan import DAN
+    from other_methods import MVCNN, MVCNNSA
+    from vsformer import VSFormer
+    from mvcnn import MVCNN as MVCNN_MVP
+
     import random
     import string
     run_folder = ''.join(random.choices(string.ascii_uppercase + string.digits, k=5))
 
-    batch_size = 64
+    batch_size = args.batch_size
 
     visual_backbone = args.artexp
     visual_bb_ftsize = visual_bb_ftsize_k[visual_backbone]
@@ -770,51 +905,57 @@ if __name__ == "__main__":
                                            f"./{base_path}/descriptions/tokens_strings", 
                                            f"./{base_path}/images",
                                            f"./preextracted_vectors_wikiart_{visual_backbone}",
-                                    indices, "train")
+                                    indices, "train", load_art_vectors=not args.no_artexp)
 
     val_dataset = DescriptionSceneMuseum(f"./{base_path}/descriptions/sentences", 
                                            f"./{base_path}/descriptions/tokens_strings", 
                                            f"./{base_path}/images",
                                            f"./preextracted_vectors_wikiart_{visual_backbone}",
-                                    indices, "val")
+                                    indices, "val", load_art_vectors=not args.no_artexp)
 
     test_dataset = DescriptionSceneMuseum(f"./{base_path}/descriptions/sentences", 
                                            f"./{base_path}/descriptions/tokens_strings", 
                                            f"./{base_path}/images",
                                            f"./preextracted_vectors_wikiart_{visual_backbone}",
-                                    indices, "test")
+                                    indices, "test", load_art_vectors=not args.no_artexp)
     
     collate_fn_to_use = collate_fn if not args.no_hiertxt else collate_fn_desc
     train_loader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate_fn_to_use, shuffle=True, num_workers=4, worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=collate_fn_to_use, shuffle=False, num_workers=4, worker_init_fn=seed_worker, generator=g)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn_to_use, shuffle=False, num_workers=4, worker_init_fn=seed_worker, generator=g)
 
-    num_epochs = 50
-    number_of_tries = 3
+    num_epochs = args.epochs
+    number_of_tries = args.n_tries
     final_output_strings = []
 
     output_feature_size = 256 # default: 256
     is_bidirectional = 'mono' not in args.room_txt_agg
     is_bidirectional_RNN_scenes = 'mono' not in args.room_vis_agg
-    room_loss_weight = 1.
+    room_loss_weight = args.room_loss_weight
     room_txt_agg = args.room_txt_agg  # rnn, avg
     room_vis_agg = args.room_vis_agg  # rnn, avg
 
-    if args.no_hiervis or args.no_hiertxt or args.no_artexp:
-        approach_name = "hierarchical_v2"
+    if args.other_method is None:
+        if args.no_hiervis or args.no_hiertxt or args.no_artexp:
+            approach_name = "hierarchical_v2"
+            if not args.no_artexp:
+                approach_name += f"_art_vectors_{visual_backbone}"
+            if not args.no_hiertxt:
+                approach_name += f"_hier_loss_room{room_loss_weight}_txt{room_txt_agg}"
+            if not args.no_hiervis:
+                approach_name += f"_vis{'bi' if is_bidirectional_RNN_scenes else ''}{room_vis_agg}"
+            approach_name += f"_gen_{GENERALIST}"
+            
+        else:
+            approach_name = f"hierarchical_v3_art_vectors_{visual_backbone}_hier_loss_room{room_loss_weight}_vis{'bi' if is_bidirectional_RNN_scenes else ''}{room_vis_agg}_txt{room_txt_agg}_gen_{GENERALIST}"
+    
+    else:
+        approach_name = args.other_method + f"_gen_{GENERALIST}"
         if not args.no_artexp:
             approach_name += f"_art_vectors_{visual_backbone}"
-        if not args.no_hiertxt:
-            approach_name += f"_hier_loss_room{room_loss_weight}_txt{room_txt_agg}"
-        if not args.no_hiervis:
-            approach_name += f"_vis{'bi' if is_bidirectional_RNN_scenes else ''}{room_vis_agg}"
-        approach_name += f"_gen_{GENERALIST}"
-        
-    else:
-        approach_name = f"hierarchical_v3_art_vectors_{visual_backbone}_hier_loss_room{room_loss_weight}_vis{'bi' if is_bidirectional_RNN_scenes else ''}{room_vis_agg}_txt{room_txt_agg}_gen_{GENERALIST}"
 
     for n_try in range(number_of_tries):
-        lr = 0.001  # default: 0.008
+        lr = args.lr  # default: 0.008
 
         loss_fn = LossContrastive(approach_name, patience=25, delta=0.0001)
         loss_fn_room = LossContrastive(approach_name, patience=25, delta=0.0001)
@@ -824,11 +965,34 @@ if __name__ == "__main__":
         else:
             model_desc_pov = HierGRUNet(hidden_size=output_feature_size, num_features=GENERALIST_FEAT_SIZE, is_bidirectional=is_bidirectional, room_txt_agg=room_txt_agg)
         
-        if args.no_hiervis:
-            model_pov = MyBaseline(in_channels=GENERALIST_FEAT_SIZE, out_channels=256, feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
-        else:
-            model_pov = MyHierBaseline_v3(in_channels=GENERALIST_FEAT_SIZE, out_channels=256, feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0, bidirectional=is_bidirectional_RNN_scenes, room_vis_agg=room_vis_agg)
+        if args.other_method is None:        
+            if args.no_hiervis:
+                __model_arch = "MyBaseline"
+                model_pov = MyBaseline(in_channels=GENERALIST_FEAT_SIZE, out_channels=256, feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+            else:
+                __model_arch = "MyHierBaseline_v3"
+                model_pov = MyHierBaseline_v3(in_channels=GENERALIST_FEAT_SIZE, out_channels=256, feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0, bidirectional=is_bidirectional_RNN_scenes, room_vis_agg=room_vis_agg)
 
+        else:
+            if args.other_method == "DAN":
+                __model_arch = "DAN"
+                model_pov = DAN(h=2, feature_dim=GENERALIST_FEAT_SIZE, num_heads=4, inner_dim=output_feature_size, dropout=0.1, output_feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+            elif args.other_method == "VSFormer":
+                __model_arch = "VSFormer"
+                model_pov = VSFormer(feature_dim=GENERALIST_FEAT_SIZE, num_layers=4, num_heads=8, attention_dropout=0.1, mlp_dropout=0.1, widening_factor=2, output_feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+            elif args.other_method == "MVCNN":
+                __model_arch = "MVCNN"
+                #model_pov = MVCNN(in_channels=GENERALIST_FEAT_SIZE, out_channels=output_feature_size, feature_size=128, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+                model_pov = MVCNN_MVP(feature_dim=GENERALIST_FEAT_SIZE, output_feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+            elif args.other_method == "MVCNNSA":
+                __model_arch = "MVCNNSA"
+                model_pov = MVCNNSA(in_channels=GENERALIST_FEAT_SIZE, out_channels=output_feature_size, feature_size=128, art_features_size=visual_bb_ftsize if not args.no_artexp else 0)
+            elif args.other_method == "merge-rooms-museum-repr":
+                __model_arch = "merge-rooms-museum-repr"
+                model_pov = MyHierBaseline_v3(in_channels=GENERALIST_FEAT_SIZE, out_channels=256, feature_size=output_feature_size, art_features_size=visual_bb_ftsize if not args.no_artexp else 0, bidirectional=is_bidirectional_RNN_scenes, room_vis_agg=room_vis_agg, merge_room_museum_repr=True, merge_method=args.merge_method)
+            else:
+                assert False, args.other_method
+        
         print(model_pov)
         print(model_desc_pov)
         model_desc_pov.to(device)
@@ -851,7 +1015,7 @@ if __name__ == "__main__":
                 config={**{
                     "batch_size": batch_size,
                     "learning_rate": lr,
-                    "architecture": MyHierBaseline_v3 if not args.no_hiervis else MyBaseline,
+                    "architecture": __model_arch,
                     "epochs": num_epochs,
                     "approach_name": approach_name,
                     "output_feature_size": output_feature_size,
